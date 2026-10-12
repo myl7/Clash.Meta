@@ -41,6 +41,7 @@ type Tailscale struct {
 	cancel      context.CancelFunc
 	startOnce   sync.Once
 	startErr    error
+	warmPaths   sync.Map
 
 	backendInitOnce sync.Once
 	backendInitCh   chan struct{}
@@ -180,6 +181,10 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 	dnsTransport := tailscaleDNSTransport{tailscale: outbound}
 	outbound.dnsResolver = dns.NewResolverFromClient(dnsTransport)
 	outbound.unregisterDNSResolver = dns.RegisterTailscaleDnsClient(option.Name, dnsTransport)
+	// Start tsnet as soon as the outbound is constructed: the engine boot,
+	// login and netmap fetch take seconds and must not be paid by the first
+	// dial, whose 5s deadline would otherwise always expire mid-login.
+	go outbound.start()
 	return outbound, nil
 }
 
@@ -238,6 +243,12 @@ func (t *Tailscale) watchBackendState() {
 		if *n.State != ipn.NoState && !backendInitialized {
 			t.setBackendInitialized(nil)
 			backendInitialized = true
+			// Build the netstack eagerly: tsnet's lazy Netstack() blocks on
+			// the first netmap, which would otherwise eat the caller's whole
+			// dial deadline before the TCP dial even starts.
+			go func() {
+				_, _ = t.server.Netstack(t.ctx)
+			}()
 			if !exitNodeNeedsStatus {
 				return
 			}
@@ -366,6 +377,7 @@ func (t *Tailscale) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.
 		if dst.Addr().Is6() {
 			src = v6
 		}
+		t.warmPeerPath(ctx, dst.Addr(), true)
 		tcpConn, err := netStack.DialContextTCPWithBind(ctx, src, dst)
 		if err != nil {
 			return nil, err
@@ -413,7 +425,47 @@ func (t *Tailscale) ResolveUDP(ctx context.Context, metadata *C.Metadata) error 
 		}
 		metadata.DstIP = ip
 	}
+	if metadata.DstIP.IsValid() {
+		t.warmPeerPath(ctx, metadata.DstIP, false)
+	}
 	return nil
+}
+
+// warmPeerPath brings the WireGuard session to the peer up before the dial
+// spends its deadline on it. A cold session needs a disco exchange to verify
+// the peer's address and one wg handshake round; the responder only replies
+// on disco-verified paths, so the first initiation can be silently dropped
+// and retried by wireguard-go only after 5s, outlasting the tunnel's 5s dial
+// deadline. A TSMP ping drives the whole warmup to completion on its own
+// budget; its success is cached briefly so connection bursts pay it once.
+func (t *Tailscale) warmPeerPath(ctx context.Context, ip netip.Addr, waitForSession bool) {
+	if v, ok := t.warmPaths.Load(ip); ok && time.Since(v.(time.Time)) < 30*time.Second {
+		return
+	}
+	t.warmPaths.Store(ip, time.Now())
+	lc, err := t.server.LocalClient()
+	if err != nil {
+		return
+	}
+	pingType := tailcfg.PingTSMP
+	budget := 5 * time.Second
+	if !waitForSession {
+		pingType = tailcfg.PingDisco
+		budget = 300 * time.Millisecond
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if remain := time.Until(deadline); remain < budget {
+			budget = remain
+		}
+	}
+	if budget <= 0 {
+		return
+	}
+	pingCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	if _, err := lc.Ping(pingCtx, ip, pingType); err != nil {
+		t.warmPaths.Delete(ip)
+	}
 }
 
 type tailscaleDNSTransport struct {
