@@ -16,6 +16,7 @@ import (
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/iface/anet"
+	"github.com/metacubex/mihomo/component/proxydialer"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/dns"
@@ -181,11 +182,56 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 	dnsTransport := tailscaleDNSTransport{tailscale: outbound}
 	outbound.dnsResolver = dns.NewResolverFromClient(dnsTransport)
 	outbound.unregisterDNSResolver = dns.RegisterTailscaleDnsClient(option.Name, dnsTransport)
-	// Start tsnet as soon as the outbound is constructed: the engine boot,
-	// login and netmap fetch take seconds and must not be paid by the first
-	// dial, whose 5s deadline would otherwise always expire mid-login.
-	go outbound.start()
+	// Start tsnet as soon as the outbound is constructed, but only once the
+	// tunnel can resolve the dialer-proxy: construction runs mid-apply,
+	// before the tunnel holds this config's proxies, and an engine that
+	// boots through byNameProxyDialer before then fails magicsock's wildcard
+	// ListenPacket ("proxyName[...] not found") on every port, which
+	// magicsock records as a UDP4 bind failure it never retries.
+	go outbound.startWhenReady()
 	return outbound, nil
+}
+
+var (
+	// Bounds for waitForDialerProxy. Vars so tests can shrink them.
+	dialerProxyInstallTick    = 20 * time.Millisecond
+	dialerProxyInstallTimeout = 10 * time.Second
+)
+
+// startWhenReady gates the eager start on the dialer-proxy being installed.
+// The wait is bounded so a name that never appears still boots and fails at
+// the dialer instead of hanging, and it ends early when the outbound closes.
+func (t *Tailscale) startWhenReady() {
+	if name := t.option.DialerProxy; name != "" {
+		waitForDialerProxy(t.ctx, t.option.NewTunnel(), name)
+	}
+	_ = t.start()
+}
+
+// waitForDialerProxy returns once the tunnel's proxy map contains name. The
+// eager engine boot races the rest of the config apply, and on a slow host
+// it can reach the first magicsock bind before the dialer-proxy is installed.
+func waitForDialerProxy(ctx context.Context, tunnel C.Tunnel, name string) {
+	pt, _ := tunnel.(proxydialer.Tunnel)
+	if pt == nil {
+		return
+	}
+	tick := time.NewTicker(dialerProxyInstallTick)
+	defer tick.Stop()
+	deadline := time.NewTimer(dialerProxyInstallTimeout)
+	defer deadline.Stop()
+	for {
+		if _, found := pt.Proxies()[name]; found {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-deadline.C:
+			return
+		case <-tick.C:
+		}
+	}
 }
 
 func (t *Tailscale) start() error {
